@@ -5,14 +5,13 @@ const WEEKEND_DAY_HOURS = ["08h", "09h", "10h", "14h", "15h", "16h", "17h"];
 const DEFAULT_CONFIG = {
   master_active: true,
   level_mode: "TB_YEU_COBAN", // TB_YEU_COBAN | ONLY_WEAK | ALL
-  block_difficult: true,      // Chặn Đổi GS & Yêu cầu GS nữ
+  block_difficult: true,
   portal_token: "",
   grades: { "7": false, "8": true, "9": true, "10": false },
   slots: {
-    "T7_18h": true,
-    "T7_19h": true,
-    "CN_18h": true,
-    "CN_19h": true
+    "T2_19h": true,
+    "T3_19h": true,
+    "T3_20h": true
   }
 };
 
@@ -53,7 +52,6 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  // Sắp xếp khung giờ chuẩn thứ tự T2 -> CN, giờ tăng dần
   function getSortedActiveSlots(slotsObj) {
     return Object.keys(slotsObj || {})
       .filter((k) => slotsObj[k] === true)
@@ -73,13 +71,11 @@ module.exports = async function handler(req, res) {
       ALL: "⚡ Lọc: Nhận mọi học lực"
     };
 
-    // Hàng chọn Khối lớp (7, 8, 9, 10)
     const gradeRow = ["7", "8", "9", "10"].map((g) => ({
       text: `${config.grades[g] ? "🟢" : "⬜"} Lớp ${g}`,
       callback_data: `GRADE_${g}`
     }));
 
-    // Hiển thị các khung giờ ĐANG BẬT (🟢) để tắt nhanh 1 chạm
     const activeSlots = getSortedActiveSlots(config.slots);
     const activeSlotRows = [];
     for (let i = 0; i < activeSlots.length; i += 3) {
@@ -133,7 +129,6 @@ module.exports = async function handler(req, res) {
     };
   }
 
-  // Bảng chọn nhanh nhiều khung giờ trống (Tối T2-CN hoặc Cuối tuần Sáng/Chiều)
   function buildSlotPicker(config, tab = "EVENING") {
     const rows = [];
 
@@ -168,7 +163,6 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // Nút chuyển qua lại giữa Khung Tối và Cuối tuần Sáng/Chiều
     rows.push([
       {
         text: tab === "EVENING" ? "☀️ Xem giờ Sáng/Chiều T7-CN" : "🌙 Xem giờ Tối T2-CN (18h-21h)",
@@ -176,7 +170,6 @@ module.exports = async function handler(req, res) {
       }
     ]);
 
-    // Nút chọn nhanh hàng loạt
     rows.push([
       { text: "⚡ Bật hết tối T2-CN", callback_data: `BULK_ALL_EVENING_${tab}` },
       { text: "🗑 Bỏ chọn tất cả", callback_data: `BULK_CLEAR_${tab}` }
@@ -187,35 +180,119 @@ module.exports = async function handler(req, res) {
     return {
       text:
         `📅 <b>CHỌN NHIỀU KHUNG GIỜ TRỐNG</b>\n` +
-        `Chạm vào từng giờ để bật (🟢) hoặc tắt (⬜). Bấm tên Thứ (VD: <b>T7</b>) để bật/tắt cả buổi tối ngày đó:`,
+        `Chạm vào từng giờ để bật (🟢) hoặc tắt (⬜). Bấm tên Thứ (VD: <b>T3</b>) để bật/tắt cả buổi tối ngày đó:`,
       reply_markup: { inline_keyboard: rows }
     };
   }
 
+  // Hàm lõi phân tích nội dung mail & chốt lớp
+  async function processEmail(rawText, isManualTest = false) {
+    const config = await getConfig();
+    if (!config.master_active) {
+      return { ok: false, reason: "Bot đang ở trạng thái TẠM DỪNG." };
+    }
+
+    const classId = (rawText.match(/ID tìm Mentor\/Gia sư:\s*(\d+)/i) || [])[1];
+    const monHoc = (rawText.match(/Môn:\s*(.+)/i) || [])[1] || "";
+    const lichHoc = (rawText.match(/Thời gian học thật:\s*(.+)/i) || [])[1] || "";
+    const ghiChu = (rawText.match(/Ghi chú:\s*(.+)/i) || [])[1] || "";
+    const namSinh = (rawText.match(/Năm sinh học viên:\s*(\d{4})/i) || [])[1] || "";
+
+    if (!classId) return { ok: false, reason: "Không tìm thấy ID lớp trong mail." };
+
+    if (config.block_difficult && /đổi\s*gs|đổi\s*gia\s*sư|gs\s*nữ|gia\s*sư\s*nữ/i.test(ghiChu)) {
+      return { ok: false, reason: `Chặn lớp ${classId}: Dính từ khóa Đổi GS hoặc GS nữ.` };
+    }
+
+    let detectedGrade = (monHoc.match(/(?:lớp|khtn|hóa|học)\s*(7|8|9|10)\b/i) || [])[1];
+    if (!detectedGrade && namSinh) {
+      const g = 2021 - parseInt(namSinh, 10);
+      if (g >= 7 && g <= 10) detectedGrade = String(g);
+    }
+    if (!detectedGrade || !config.grades[detectedGrade]) {
+      return { ok: false, reason: `Chặn lớp ${classId}: Khối ${detectedGrade || "?"} đang tắt.` };
+    }
+
+    const requiredSlots = extractSlotKeys(lichHoc);
+    const isAvailable = requiredSlots.length > 0 && requiredSlots.every((s) => config.slots[s] === true);
+    if (!isAvailable) {
+      return {
+        ok: false,
+        reason: `Bỏ qua lớp ${classId}: Khung [${requiredSlots.join(", ") || "Không rõ"}] chưa bật hoặc đã bị khóa.`
+      };
+    }
+
+    const combinedInfo = `${monHoc} ${ghiChu}`;
+    const isHighLevel = /nâng\s*cao|chuyên|hsg|học\s*sinh\s*giỏi|bồi\s*dưỡng|ôn\s*thi\s*chuyên/i.test(combinedInfo);
+    const isWeakOrAvg = /trung\s*bình|yếu|kém|mất\s*gốc|hổng|chậm|lấy\s*lại\s*gốc/i.test(combinedInfo);
+
+    if (config.level_mode === "TB_YEU_COBAN" && isHighLevel) {
+      return { ok: false, reason: `Chặn lớp ${classId}: Lớp Nâng cao / Chuyên.` };
+    }
+    if (config.level_mode === "ONLY_WEAK" && !isWeakOrAvg) {
+      return { ok: false, reason: `Bỏ qua lớp ${classId}: Không ghi rõ TB/Yếu/Mất gốc.` };
+    }
+
+    let claimSuccess = false;
+    if (DRY_RUN || isManualTest) {
+      claimSuccess = true;
+    } else {
+      const claimRes = await fetch("URL_API_NHAN_LOP_CUA_FUNIX", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${config.portal_token}`
+        },
+        body: JSON.stringify({ id: Number(classId) })
+      });
+      claimSuccess = claimRes.ok;
+    }
+
+    if (claimSuccess) {
+      requiredSlots.forEach((s) => delete config.slots[s]);
+      await updateConfig(config);
+
+      const tag = DRY_RUN || isManualTest ? "🧪 [TEST] " : "🎉 ";
+      const menu = buildMainMenu(config);
+      await callTele("sendMessage", {
+        chat_id: ADMIN_CHAT_ID,
+        text:
+          `${tag}<b>ĐÃ CHỐT LỚP ${classId} (Lớp ${detectedGrade})!</b>\n` +
+          `🔒 Đã khóa khung: <b>${requiredSlots.join(", ")}</b>\n` +
+          `📚 <b>Môn:</b> ${monHoc.trim()}\n` +
+          `⏰ <b>Lịch:</b> ${lichHoc.trim()}\n` +
+          `📝 <b>Ghi chú:</b> ${ghiChu.trim()}\n\n` +
+          menu.text,
+        parse_mode: "HTML",
+        reply_markup: menu.reply_markup
+      });
+      return { ok: true, reason: `Đã chốt lớp ${classId}, khóa khung ${requiredSlots.join(", ")}` };
+    }
+
+    return { ok: false, reason: `Gọi API chốt lớp ${classId} thất bại.` };
+  }
+
   // =========================================================================
-  // 1. CHẾ ĐỘ TEST NHANH QUA TRÌNH DUYỆT (?test=good hoặc ?test=bad)
+  // 1. TEST QUA TRÌNH DUYỆT (Hỗ trợ ?test=good&lich=T2%2019h00-20h00)
   // =========================================================================
-  let incomingEmailText = "";
   if (req.method === "GET") {
     const testType = req.query?.test;
     if (testType === "bad") {
-      incomingEmailText = `
-        ID tìm Mentor/Gia sư: 69169
-        Môn: Hóa học lớp 9 - Cơ bản - Học thử
-        Thời gian học thật: Lịch học: 1b/tuần. T7 18h00-19h00
-        Ghi chú: KHTN 9 - Đổi GS HV Văn 2k12. Yêu cầu: GS NỮ
-      `;
-    } else if (testType === "good") {
-      incomingEmailText = `
-        ID tìm Mentor/Gia sư: 99999
-        Môn: Hóa học lớp 9 - Cơ bản
-        Thù lao lớp học thật: 63,000
-        Thời gian học thật: Lịch học: 1b/tuần. T7 18h00-19h00
-        Ghi chú: Học viên ngoan, cần củng cố kiến thức cơ bản
-      `;
-    } else {
-      return res.status(200).send("Bot săn lớp đang hoạt động. Dùng ?test=good hoặc ?test=bad để test.");
+      const result = await processEmail(
+        `ID tìm Mentor/Gia sư: 69169\nMôn: Hóa học lớp 9 - Cơ bản\nThời gian học thật: T2 19h00-20h00\nGhi chú: Đổi GS. Yêu cầu: GS NỮ`,
+        true
+      );
+      return res.status(200).json(result);
     }
+    if (testType === "good") {
+      const customLich = req.query?.lich || "T2 19h00-20h00";
+      const result = await processEmail(
+        `ID tìm Mentor/Gia sư: 99999\nMôn: Hóa học lớp 9 - Cơ bản\nThời gian học thật: Lịch học: 1b/tuần. ${customLich}\nGhi chú: Học viên lực học trung bình, cần củng cố kiến thức`,
+        true
+      );
+      return res.status(200).json(result);
+    }
+    return res.status(200).send("Bot săn lớp đang hoạt động.");
   }
 
   const body = req.body || {};
@@ -238,7 +315,6 @@ module.exports = async function handler(req, res) {
 
     if (action === "NOOP") return res.status(200).send("OK");
 
-    // Các thao tác bấm nút -> Sửa trực tiếp tin nhắn hiện tại cho gọn màn hình
     if (action) {
       let view = null;
 
@@ -311,7 +387,26 @@ module.exports = async function handler(req, res) {
       return res.status(200).send("OK");
     }
 
-    // Lệnh gõ nhanh bằng text trên điện thoại (VD: /gio T2 19h 20h, T7 18h 19h)
+    // Lệnh TEST trực tiếp trong Telegram (VD: /test T2 19h hoặc /test T3 20h)
+    if (text.startsWith("/test")) {
+      const rawSched = text.replace("/test", "").trim() || "T2 19h";
+      const normSched = rawSched.replace(/(\d{1,2})h(?!\d)/gi, "$1h00");
+      const fakeMail =
+        `ID tìm Mentor/Gia sư: ${Math.floor(10000 + Math.random() * 90000)}\n` +
+        `Môn: Hóa học lớp 9 - Cơ bản\n` +
+        `Thời gian học thật: Lịch học: 1b/tuần. ${normSched}\n` +
+        `Ghi chú: Học viên lực học trung bình, cần củng cố kiến thức cơ bản`;
+
+      const result = await processEmail(fakeMail, true);
+      if (!result.ok) {
+        await callTele("sendMessage", {
+          chat_id: chatId,
+          text: `⚠️ <b>[KẾT QUẢ TEST]</b>\n${result.reason}`
+        });
+      }
+      return res.status(200).send("OK");
+    }
+
     if (text.startsWith("/gio ")) {
       const raw = text.replace("/gio ", "").toUpperCase();
       const parts = raw.split(/[,;]+/);
@@ -340,95 +435,13 @@ module.exports = async function handler(req, res) {
   }
 
   // =========================================================================
-  // 3. XỬ LÝ PHÂN TÍCH EMAIL ĐỔ VỀ
+  // 3. XỬ LÝ MAIL THẬT ĐỔ VỀ TỪ WEBHOOK GMAIL
   // =========================================================================
-  const rawText = incomingEmailText || body.text || body.html || "";
+  const rawText = body.text || body.html || "";
   if (!rawText) return res.status(200).send("Empty payload");
 
-  const config = await getConfig();
-  if (!config.master_active) return res.status(200).json({ status: "Bỏ qua: Bot đang tạm dừng" });
-
-  const classId = (rawText.match(/ID tìm Mentor\/Gia sư:\s*(\d+)/i) || [])[1];
-  const monHoc = (rawText.match(/Môn:\s*(.+)/i) || [])[1] || "";
-  const lichHoc = (rawText.match(/Thời gian học thật:\s*(.+)/i) || [])[1] || "";
-  const ghiChu = (rawText.match(/Ghi chú:\s*(.+)/i) || [])[1] || "";
-  const namSinh = (rawText.match(/Năm sinh học viên:\s*(\d{4})/i) || [])[1] || "";
-
-  if (!classId) return res.status(200).json({ status: "Không tìm thấy ID lớp" });
-
-  // Bước 1: Chặn Đổi GS & GS Nữ (nếu đang bật)
-  if (config.block_difficult && /đổi\s*gs|đổi\s*gia\s*sư|gs\s*nữ|gia\s*sư\s*nữ/i.test(ghiChu)) {
-    return res.status(200).json({ status: `Chặn lớp ${classId}: Dính Đổi GS hoặc GS nữ` });
-  }
-
-  // Bước 2: Kiểm tra Khối lớp (ưu tiên đọc từ tên Môn, dự phòng suy ra từ Năm sinh)
-  let detectedGrade = (monHoc.match(/(?:lớp|khtn|hóa|học)\s*(7|8|9|10)\b/i) || [])[1];
-  if (!detectedGrade && namSinh) {
-    const g = 2021 - parseInt(namSinh, 10); // Năm học 2026-2027: 2k12 -> lớp 9, 2k13 -> lớp 8
-    if (g >= 7 && g <= 10) detectedGrade = String(g);
-  }
-  if (!detectedGrade || !config.grades[detectedGrade]) {
-    return res.status(200).json({ status: `Chặn lớp ${classId}: Khối ${detectedGrade || "?"} đang tắt` });
-  }
-
-  // Bước 3: Kiểm tra khung giờ có đang mở (🟢) không
-  const requiredSlots = extractSlotKeys(lichHoc);
-  const isAvailable = requiredSlots.length > 0 && requiredSlots.every((s) => config.slots[s] === true);
-  if (!isAvailable) {
-    return res.status(200).json({ status: `Bỏ qua lớp ${classId}: Khung ${requiredSlots.join(", ")} chưa mở` });
-  }
-
-  // Bước 4: Lọc học lực theo chế độ đã chọn
-  const combinedInfo = `${monHoc} ${ghiChu}`;
-  const isHighLevel = /nâng\s*cao|chuyên|hsg|học\s*sinh\s*giỏi|bồi\s*dưỡng|ôn\s*thi\s*chuyên/i.test(combinedInfo);
-  const isWeakOrAvg = /trung\s*bình|yếu|kém|mất\s*gốc|hổng|chậm|lấy\s*lại\s*gốc/i.test(combinedInfo);
-
-  if (config.level_mode === "TB_YEU_COBAN" && isHighLevel) {
-    return res.status(200).json({ status: `Chặn lớp ${classId}: Lớp Nâng cao / Chuyên` });
-  }
-  if (config.level_mode === "ONLY_WEAK" && !isWeakOrAvg) {
-    return res.status(200).json({ status: `Bỏ qua lớp ${classId}: Không ghi rõ TB/Yếu/Mất gốc` });
-  }
-
-  // Bước 5: Chốt lớp (Test hoặc API thật)
-  let claimSuccess = false;
-  if (DRY_RUN) {
-    claimSuccess = true;
-  } else {
-    const claimRes = await fetch("URL_API_NHAN_LOP_CUA_FUNIX", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.portal_token}`
-      },
-      body: JSON.stringify({ id: Number(classId) })
-    });
-    claimSuccess = claimRes.ok;
-  }
-
-  if (claimSuccess) {
-    // Khóa đúng khung giờ vừa chốt để không nhận trùng
-    requiredSlots.forEach((s) => delete config.slots[s]);
-    await updateConfig(config);
-
-    const tag = DRY_RUN ? "🧪 [TEST] " : "🎉 ";
-    const menu = buildMainMenu(config);
-    await callTele("sendMessage", {
-      chat_id: ADMIN_CHAT_ID,
-      text:
-        `${tag}<b>ĐÃ CHỐT LỚP ${classId} (Lớp ${detectedGrade})!</b>\n` +
-        `🔒 Đã khóa khung: <b>${requiredSlots.join(", ")}</b>\n` +
-        `📚 <b>Môn:</b> ${monHoc.trim()}\n` +
-        `⏰ <b>Lịch:</b> ${lichHoc.trim()}\n` +
-        `📝 <b>Ghi chú:</b> ${ghiChu.trim()}\n\n` +
-        menu.text,
-      parse_mode: "HTML",
-      reply_markup: menu.reply_markup
-    });
-    return res.status(200).json({ status: "Thành công", locked_slots: requiredSlots });
-  }
-
-  return res.status(200).json({ status: "Gọi API thất bại" });
+  const result = await processEmail(rawText, false);
+  return res.status(200).json(result);
 };
 
 function extractSlotKeys(lichHocStr) {
